@@ -3,6 +3,10 @@
 __pycache__/
 *.pyc
 
+# Auto-generated self-signed cert for mic mode (HTTPS)
+.mic-cert.pem
+.mic-key.pem
+
 # Local agent tooling / editor state — not part of the app
 .agents/
 .atelier/

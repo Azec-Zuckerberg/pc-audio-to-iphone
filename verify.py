@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import math
 import os
+import ssl
 import struct
 import tempfile
 import time
@@ -25,6 +26,27 @@ import aiohttp
 from aiortc import RTCPeerConnection, RTCSessionDescription
 
 PHASE_S = 4
+
+
+async def post_offer(session: aiohttp.ClientSession, port: int, payload: dict) -> dict:
+    """The server now serves both modes on one port, over HTTPS (self-signed)
+    when a cert is available and plain HTTP otherwise. Try HTTPS first with
+    certificate verification disabled (it's our own localhost cert), then fall
+    back to HTTP so this check works in either configuration."""
+    insecure = ssl.create_default_context()
+    insecure.check_hostname = False
+    insecure.verify_mode = ssl.CERT_NONE
+    last_err: Exception | None = None
+    for scheme in ("https", "http"):
+        try:
+            async with session.post(
+                f"{scheme}://127.0.0.1:{port}/offer", json=payload, ssl=insecure
+            ) as resp:
+                assert resp.status == 200, f"HTTP {resp.status}"
+                return await resp.json()
+        except (aiohttp.ClientError, ssl.SSLError) as err:
+            last_err = err
+    raise RuntimeError(f"could not reach server on port {port}: {last_err}")
 
 
 def make_tone_wav(path: str) -> None:
@@ -88,12 +110,11 @@ async def main() -> int:
 
     await pc.setLocalDescription(await pc.createOffer())
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"http://127.0.0.1:{args.port}/offer",
-            json={"sdp": pc.localDescription.sdp, "type": pc.localDescription.type},
-        ) as resp:
-            assert resp.status == 200, f"HTTP {resp.status}"
-            answer = await resp.json()
+        answer = await post_offer(
+            session,
+            args.port,
+            {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type},
+        )
     await pc.setRemoteDescription(RTCSessionDescription(**answer))
     await asyncio.wait_for(started.wait(), timeout=20)
     await asyncio.sleep(1)  # let the connection settle

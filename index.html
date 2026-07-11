@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
-<title>PC Audio → iPhone</title>
+<title>PC ↔ iPhone audio</title>
 <style>
   /* Strict monochrome: pure #000 background (true black on OLED), pure #fff
      ink. Secondary text is white at reduced opacity — no colors anywhere. */
@@ -18,15 +18,27 @@
   main { text-align: center; padding: 24px; }
   h1 {
     font-size: 1rem; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase;
-    color: #fff; opacity: 0.55; margin: 0 0 2.6rem;
+    color: #fff; opacity: 0.55; margin: 0 0 1.8rem;
   }
+  /* Segmented LISTEN / MIC toggle. */
+  #modes {
+    display: inline-flex; border: 2px solid #fff; border-radius: 999px;
+    overflow: hidden; margin-bottom: 1.6rem;
+  }
+  .mode {
+    font-size: 0.8rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+    padding: 0.7em 1.6em; background: #000; color: #fff; border: none;
+    touch-action: manipulation;
+  }
+  .mode[aria-selected="true"] { background: #fff; color: #000; }
+  #hint { margin: 0 0 1.8rem; min-height: 1.2em; color: #fff; opacity: 0.5; font-size: 0.85rem; }
   #start {
     font-size: 1.4rem; font-weight: 700; letter-spacing: 0.1em; padding: 1.1em 2.8em;
     border: 2px solid #fff; border-radius: 999px; background: #fff; color: #000;
     touch-action: manipulation;
   }
   #start:disabled { background: #000; color: #fff; opacity: 0.4; }
-  #status { margin-top: 2.6rem; min-height: 1.4em; color: #fff; font-size: 1rem; }
+  #status { margin-top: 2.2rem; min-height: 1.4em; color: #fff; font-size: 1rem; }
   #stats {
     margin-top: 0.5rem; min-height: 1.2em; color: #fff; opacity: 0.45;
     font-size: 0.85rem; font-variant-numeric: tabular-nums;
@@ -35,12 +47,18 @@
 </head>
 <body>
 <main>
-  <h1>PC → AirPods audio</h1>
+  <h1>AirPods WiFi Bridge</h1>
+  <div id="modes" role="tablist">
+    <button class="mode" id="mode-listen" role="tab" aria-selected="true">Listen</button>
+    <button class="mode" id="mode-mic" role="tab" aria-selected="false">Mic</button>
+  </div>
+  <p id="hint"></p>
   <button id="start">START</button>
   <p id="status">Tap Start to connect</p>
   <p id="stats"></p>
   <!-- playsinline + autoplay: sound still only starts after the user-gesture
-       unlock performed inside the Start click handler (iOS Safari policy). -->
+       unlock performed inside the Start click handler (iOS Safari policy).
+       Used in Listen mode only; Mic mode never plays anything back. -->
   <audio id="player" autoplay playsinline></audio>
 </main>
 
@@ -49,40 +67,77 @@
 const startBtn = document.getElementById("start");
 const statusEl = document.getElementById("status");
 const statsEl = document.getElementById("stats");
+const hintEl = document.getElementById("hint");
 const player = document.getElementById("player");
+const modeListenBtn = document.getElementById("mode-listen");
+const modeMicBtn = document.getElementById("mode-mic");
+
 let pc = null;
+let micStream = null;
 let statsTimer = null;
-let prevInbound = null;
+let prevRtp = null;
+let mode = "listen";  // "listen" = PC->AirPods, "mic" = phone mic -> PC
 
 function setStatus(text) { statusEl.textContent = text; }
 
-// Live view of Safari's receive jitter buffer — the browser-side share of the
-// total delay. jitterBufferDelay/EmittedCount are cumulative, so diff two
-// snapshots to get the average buffer depth over the last second.
+// Mic capture (getUserMedia) needs a secure context: served over https:// or
+// localhost. Loaded over plain http://LAN-IP the browser hides the mic API, so
+// tell the user to switch to the https URL rather than failing cryptically.
+const micSupported = window.isSecureContext &&
+  !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+
+function refreshHint() {
+  if (mode === "listen") {
+    hintEl.textContent = "Play this PC's audio through your AirPods.";
+  } else if (micSupported) {
+    hintEl.textContent = "Use your iPhone's microphone as a PC input.";
+  } else {
+    hintEl.textContent = "Mic needs the https:// address — reopen this page there.";
+  }
+}
+
+function selectMode(next) {
+  if (pc) return;  // don't switch mid-session
+  mode = next;
+  modeListenBtn.setAttribute("aria-selected", String(next === "listen"));
+  modeMicBtn.setAttribute("aria-selected", String(next === "mic"));
+  refreshHint();
+}
+
+modeListenBtn.addEventListener("click", () => selectMode("listen"));
+modeMicBtn.addEventListener("click", () => selectMode("mic"));
+
+// Live diagnostics. Listen mode reads the receive jitter buffer (the browser's
+// share of total delay); mic mode reads the outbound packet rate so you can see
+// the mic is actually sending (~50 pkt/s at 20 ms ptime).
 function startStats() {
   stopStats();
   statsTimer = setInterval(async () => {
     if (!pc || pc.connectionState !== "connected") return;
     const report = await pc.getStats();
+    const wantType = mode === "listen" ? "inbound-rtp" : "outbound-rtp";
     report.forEach((entry) => {
-      if (entry.type !== "inbound-rtp" || entry.kind !== "audio") return;
-      if (prevInbound && entry.jitterBufferDelay !== undefined) {
-        const delay = entry.jitterBufferDelay - prevInbound.jitterBufferDelay;
-        const count = entry.jitterBufferEmittedCount - prevInbound.jitterBufferEmittedCount;
-        const lost = Math.max(0, (entry.packetsLost || 0) - (prevInbound.packetsLost || 0));
+      if (entry.type !== wantType || entry.kind !== "audio") return;
+      if (mode === "listen" && prevRtp && entry.jitterBufferDelay !== undefined) {
+        const delay = entry.jitterBufferDelay - prevRtp.jitterBufferDelay;
+        const count = entry.jitterBufferEmittedCount - prevRtp.jitterBufferEmittedCount;
+        const lost = Math.max(0, (entry.packetsLost || 0) - (prevRtp.packetsLost || 0));
         if (count > 0) {
           statsEl.textContent =
             "buffer " + Math.round((delay / count) * 1000) + " ms · " + lost + " pkt lost/s";
         }
+      } else if (mode === "mic" && prevRtp && entry.packetsSent !== undefined) {
+        const sent = entry.packetsSent - prevRtp.packetsSent;
+        statsEl.textContent = "sending " + sent + " pkt/s";
       }
-      prevInbound = entry;
+      prevRtp = entry;
     });
   }, 1000);
 }
 
 function stopStats() {
   if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
-  prevInbound = null;
+  prevRtp = null;
   statsEl.textContent = "";
 }
 
@@ -101,41 +156,69 @@ function waitForIceGathering(pc) {
   });
 }
 
+function cleanup() {
+  if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+  if (pc) { pc.close(); pc = null; }
+}
+
 async function start() {
   startBtn.disabled = true;
+  modeListenBtn.disabled = modeMicBtn.disabled = true;
   setStatus("Connecting…");
-
-  // Unlock audio while we are still inside the click gesture: iOS Safari only
-  // honors .play() calls traceable to a user interaction. Playing the (still
-  // empty) element now grants playback for the WebRTC stream arriving later.
-  player.play().catch(() => {});
 
   // Same-LAN only: host candidates are enough, no STUN/TURN servers needed.
   pc = new RTCPeerConnection({ iceServers: [] });
+  const endpoint = mode === "mic" ? "/mic-offer" : "/offer";
 
-  const transceiver = pc.addTransceiver("audio", { direction: "recvonly" });
+  try {
+    if (mode === "listen") {
+      // Unlock audio while still inside the click gesture: iOS Safari only
+      // honors .play() calls traceable to a user interaction. Playing the
+      // (empty) element now grants playback for the stream arriving later.
+      player.play().catch(() => {});
 
-  // LATENCY KNOB: ask the browser for its minimum receive jitter buffer
-  // (0 = as low as it dares; browsers keep an internal floor and still adapt
-  // upward if the WiFi turns bad). playoutDelayHint is the older Chrome-ism,
-  // jitterBufferTarget the current spec name; browsers lacking both ignore this.
-  const receiver = transceiver.receiver;
-  try { if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0; } catch (e) {}
-  try { if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0; } catch (e) {}
+      const transceiver = pc.addTransceiver("audio", { direction: "recvonly" });
+      // LATENCY KNOB: ask for the minimum receive jitter buffer (0 = as low as
+      // the browser dares; it keeps an internal floor and adapts up on bad WiFi).
+      const receiver = transceiver.receiver;
+      try { if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0; } catch (e) {}
+      try { if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0; } catch (e) {}
 
-  pc.addEventListener("track", (evt) => {
-    player.srcObject = evt.streams[0];
-    player.play().catch(() => setStatus("Audio blocked — tap Start again"));
-  });
+      pc.addEventListener("track", (evt) => {
+        player.srcObject = evt.streams[0];
+        player.play().catch(() => setStatus("Audio blocked — tap Start again"));
+      });
+    } else {
+      if (!micSupported) throw new Error("mic needs the https:// address");
+      // Raw-ish mic: leave echo cancellation off (not a call), keep noise
+      // suppression + auto gain so it's usable as a general PC microphone.
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true },
+      });
+      for (const track of micStream.getAudioTracks()) {
+        pc.addTransceiver(track, { direction: "sendonly" });
+      }
+    }
+  } catch (err) {
+    setStatus("Error: " + err.message);
+    startBtn.disabled = false;
+    modeListenBtn.disabled = modeMicBtn.disabled = false;
+    cleanup();
+    return;
+  }
 
   pc.addEventListener("connectionstatechange", () => {
     if (pc.connectionState === "connected") {
-      setStatus("Streaming — keep this page open & screen on");
+      setStatus(mode === "mic"
+        ? "Mic live — keep this page open & screen on"
+        : "Streaming — keep this page open & screen on");
       startStats();
     } else if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
       setStatus("Disconnected — tap Start to reconnect");
       startBtn.disabled = false;
+      modeListenBtn.disabled = modeMicBtn.disabled = false;
       stopStats();
+      cleanup();
     } else {
       setStatus("Connection: " + pc.connectionState);
     }
@@ -144,7 +227,7 @@ async function start() {
   try {
     await pc.setLocalDescription(await pc.createOffer());
     await waitForIceGathering(pc);
-    const response = await fetch("/offer", {
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
@@ -154,16 +237,19 @@ async function start() {
   } catch (err) {
     setStatus("Error: " + err.message);
     startBtn.disabled = false;
-    if (pc) { pc.close(); pc = null; }
+    modeListenBtn.disabled = modeMicBtn.disabled = false;
+    stopStats();
+    cleanup();
     return;
   }
 
-  // Best effort: keep the screen awake. iOS suspends Safari (and this audio)
+  // Best effort: keep the screen awake. iOS suspends Safari (and this session)
   // when the phone locks or the tab goes to background.
   try { await navigator.wakeLock.request("screen"); } catch (e) {}
 }
 
 startBtn.addEventListener("click", start);
+refreshHint();
 </script>
 </body>
 </html>

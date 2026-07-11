@@ -1,24 +1,33 @@
 """
-server.py — stream Windows system audio to an iPhone over WiFi using WebRTC.
+server.py — bridge Windows system audio and an iPhone over WiFi, both ways.
 
-Pipeline:
+Listen (default, PC -> AirPods):
     WASAPI loopback (pyaudiowpatch) -> LoopbackAudioTrack (aiortc) -> Opus/RTP -> mobile Safari
+Mic (opt-in, iPhone -> PC):
+    Safari getUserMedia -> Opus/RTP -> MicPlayback (aiortc) -> WASAPI output device
 
-One process, one port: aiohttp serves index.html plus the single POST /offer
-signaling endpoint; aiortc owns the WebRTC session and encodes Opus.
+aiohttp serves index.html plus two signaling endpoints (POST /offer for listen,
+POST /mic-offer for mic); aiortc owns the WebRTC sessions and (de)codes Opus.
+Both modes share ONE port. Mic mode requires a secure context (browsers only
+grant microphone access over HTTPS), so the server generates a self-signed cert
+and serves everything over HTTPS; listen mode rides the same origin. If a cert
+can't be made it falls back to plain HTTP (listen only, mic unavailable).
 
 Usage:
     python server.py                 # capture the current default output device
-    python server.py --list-devices  # show every capturable loopback device
+    python server.py --list-devices  # show capture + output devices
     python server.py --device 21     # capture a specific loopback device
-    python server.py --port 9000     # serve on another port (default 8080)
+    python server.py --mic-device 30 # play the phone's mic into device 30 (e.g. VB-CABLE)
+    python server.py --port 9000     # serve both modes on port 9000 (default 8080)
 """
 
 import argparse
 import asyncio
 import fractions
 import logging
+import queue as thread_queue
 import socket
+import ssl
 import threading
 import time
 from pathlib import Path
@@ -28,6 +37,7 @@ from aiohttp import web
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamError
 from av import AudioFrame
+from av.audio.resampler import AudioResampler
 
 ROOT = Path(__file__).parent
 DEFAULT_PORT = 8080
@@ -245,6 +255,167 @@ class LoopbackAudioTrack(MediaStreamTrack):
 
 
 # --------------------------------------------------------------------------- #
+# Reverse direction: iPhone microphone -> PC output device
+# --------------------------------------------------------------------------- #
+class MicPlayback:
+    """Plays an INCOMING WebRTC audio track (the iPhone's real microphone) out
+    through a WASAPI *output* device — the mirror image of LoopbackAudioTrack.
+
+    Point --mic-device at a virtual audio cable (e.g. VB-CABLE's "CABLE
+    Input") and the phone becomes a microphone that every other Windows app
+    can select. With no virtual cable it simply monitors through your speakers.
+
+    The output stream is opened LAZILY and ref-counted: it exists only while at
+    least one phone is connected in mic mode. So a listen-only session pays
+    nothing, and there is no speaker<->loopback feedback risk when mic mode is
+    unused (playing the phone mic to the same speakers this program captures
+    would otherwise loop back to the phone).
+
+    Latency is bounded the same way capture is: the hand-off queue is shallow
+    and drops the OLDEST buffered audio on overflow, so a slow sound card costs
+    a glitch, never growing delay.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, device_index: int | None = None):
+        self._loop = loop
+        self._pa = pyaudio.PyAudio()
+        self.device = self._pick_output(device_index)
+        self.rate = int(self.device["defaultSampleRate"])
+        self.channels = min(int(self.device["maxOutputChannels"]) or 2, 2)
+        self._layout = "stereo" if self.channels == 2 else "mono"
+        self._buf: "thread_queue.Queue[bytes]" = thread_queue.Queue(maxsize=8)
+        self._lock = threading.Lock()
+        self._refs = 0
+        self._stream = None
+        self._thread: threading.Thread | None = None
+        self._running = False
+
+    def _pick_output(self, device_index: int | None) -> dict:
+        if device_index is not None:
+            device = self._pa.get_device_info_by_index(device_index)
+            if int(device.get("maxOutputChannels", 0)) < 1:
+                raise SystemExit(
+                    f"Device {device_index} ({device['name']!r}) has no output "
+                    f"channels; it cannot play the phone's mic. Run with "
+                    f"--list-devices to see valid choices."
+                )
+            return device
+        try:
+            return self._pa.get_default_output_device_info()
+        except (OSError, LookupError) as exc:
+            raise SystemExit(
+                "Could not find a default output device to play the phone's mic "
+                f"into. Pick one explicitly with --mic-device. Original error: {exc}"
+            )
+
+    # -- ref-counted stream lifetime ---------------------------------------- #
+    def _acquire(self) -> None:
+        with self._lock:
+            self._refs += 1
+            if self._refs == 1:
+                self._open()
+
+    def _release(self) -> None:
+        with self._lock:
+            self._refs -= 1
+            if self._refs <= 0:
+                self._refs = 0
+                self._close_locked()
+
+    def _open(self) -> None:
+        self._stream = self._pa.open(
+            format=pyaudio.paInt16,
+            channels=self.channels,
+            rate=self.rate,
+            output=True,
+            output_device_index=self.device["index"],
+            frames_per_buffer=self.rate * CHUNK_MS // 1000,
+        )
+        self._running = True
+        self._thread = threading.Thread(target=self._run, name="mic-playback", daemon=True)
+        self._thread.start()
+        log.info("Mic playback opened on [%d] %s", self.device["index"], self.device["name"])
+
+    def _close_locked(self) -> None:
+        self._running = False
+        try:
+            self._buf.put_nowait(b"")  # wake the drain thread out of its get() wait
+        except thread_queue.Full:
+            pass
+        if self._thread:
+            self._thread.join(timeout=1)
+            self._thread = None
+        if self._stream:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        while not self._buf.empty():  # drop stale audio so the next session is fresh
+            try:
+                self._buf.get_nowait()
+            except thread_queue.Empty:
+                break
+
+    def _run(self) -> None:
+        """Blocking write loop in its own thread (the event loop never waits on
+        the sound card). getUserMedia streams continuously, so unlike loopback
+        capture there is no silent-starvation case to schedule around here."""
+        _boost_capture_thread_priority()
+        while self._running:
+            try:
+                data = self._buf.get(timeout=0.1)
+            except thread_queue.Empty:
+                continue
+            if data and self._stream is not None:
+                try:
+                    self._stream.write(data)
+                except OSError as exc:
+                    log.error("Mic playback write failed (%s); stopping playback.", exc)
+                    break
+
+    def _enqueue(self, data: bytes) -> None:
+        # Depth-bounded, drop-oldest — same anti-buffering rule as capture.
+        try:
+            self._buf.put_nowait(data)
+        except thread_queue.Full:
+            try:
+                self._buf.get_nowait()
+            except thread_queue.Empty:
+                pass
+            try:
+                self._buf.put_nowait(data)
+            except thread_queue.Full:
+                pass
+
+    async def consume(self, track: MediaStreamTrack) -> None:
+        """Drain an incoming mic track: pull decoded frames, resample to the
+        output device's rate/layout, and hand the PCM to the playback thread.
+        Runs until the peer disconnects (recv raises MediaStreamError)."""
+        resampler = AudioResampler(format="s16", layout=self._layout, rate=self.rate)
+        self._acquire()
+        try:
+            while True:
+                frame = await track.recv()
+                for out in resampler.resample(frame):
+                    # Packed s16: one plane of interleaved samples. Slice to the
+                    # exact valid length (av may pad the buffer) — reading the
+                    # plane bytes directly avoids a numpy dependency.
+                    self._enqueue(bytes(out.planes[0])[: out.samples * self.channels * 2])
+        except MediaStreamError:
+            pass
+        finally:
+            self._release()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._refs = 0
+            self._close_locked()
+        self._pa.terminate()
+
+
+# --------------------------------------------------------------------------- #
 # HTTP: static page + signaling
 # --------------------------------------------------------------------------- #
 async def index(request: web.Request) -> web.FileResponse:
@@ -268,6 +439,40 @@ async def offer(request: web.Request) -> web.Response:
         log.info("Peer connection state: %s", pc.connectionState)
         if pc.connectionState in ("failed", "closed"):
             track.stop()
+            await pc.close()
+            request.app["pcs"].discard(pc)
+
+    await pc.setRemoteDescription(remote_offer)
+    await pc.setLocalDescription(await pc.createAnswer())
+    return web.json_response(
+        {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+    )
+
+
+async def mic_offer(request: web.Request) -> web.Response:
+    """Reverse-direction signaling: the phone sends a sendonly offer carrying
+    its microphone; the PC receives the track and plays it into the mic
+    playback device. Same non-trickle offer/answer shape as /offer."""
+    params = await request.json()
+    remote_offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+
+    pc = RTCPeerConnection()
+    request.app["pcs"].add(pc)
+    playback = request.app["mic_playback"]
+    log.info("New mic peer (%d active)", len(request.app["pcs"]))
+
+    @pc.on("track")
+    def on_track(track: MediaStreamTrack) -> None:
+        if track.kind != "audio":
+            return
+        task = asyncio.ensure_future(playback.consume(track))
+        request.app["mic_tasks"].add(task)
+        task.add_done_callback(request.app["mic_tasks"].discard)
+
+    @pc.on("connectionstatechange")
+    async def on_state_change() -> None:
+        log.info("Mic peer connection state: %s", pc.connectionState)
+        if pc.connectionState in ("failed", "closed"):
             await pc.close()
             request.app["pcs"].discard(pc)
 
@@ -322,40 +527,142 @@ def get_all_ipv4() -> list[str]:
     return sorted(ip for ip in ips if not ip.startswith("127."))
 
 
+def ensure_self_signed_cert() -> tuple[Path, Path] | None:
+    """Mic mode needs HTTPS: browsers only grant getUserMedia (microphone
+    access) in a secure context, so plain http://LAN-IP is blocked. We
+    self-sign a long-lived cert once and cache it next to server.py; the phone
+    shows a one-time "not trusted" warning the user taps through (proceeding
+    still grants the secure context Safari requires). Returns None — disabling
+    mic mode but leaving listen mode untouched — if signing isn't possible."""
+    cert_path = ROOT / ".mic-cert.pem"
+    key_path = ROOT / ".mic-key.pem"
+    if cert_path.exists() and key_path.exists():
+        return cert_path, key_path
+    try:
+        import datetime
+        import ipaddress
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        log.warning("cryptography unavailable; cannot self-sign a cert, so mic mode is off.")
+        return None
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "airpods-bridge")])
+    sans: list[x509.GeneralName] = [x509.DNSName("localhost")]
+    for ip in [*get_all_ipv4(), "127.0.0.1"]:
+        try:
+            sans.append(x509.IPAddress(ipaddress.ip_address(ip)))
+        except ValueError:
+            pass
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName(sans), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    log.info("Generated self-signed cert for mic mode (%s).", cert_path.name)
+    return cert_path, key_path
+
+
 # --------------------------------------------------------------------------- #
 # Lifecycle
 # --------------------------------------------------------------------------- #
-def make_on_startup(device_index: int | None, port: int):
+def make_on_startup(device_index: int | None, mic_device_index: int | None):
     async def on_startup(app: web.Application) -> None:
-        capture = LoopbackCapture(asyncio.get_running_loop(), device_index)
+        loop = asyncio.get_running_loop()
+        capture = LoopbackCapture(loop, device_index)
         capture.start()
         app["capture"] = capture
-        primary = get_lan_ip()
-        others = [ip for ip in get_all_ipv4() if ip != primary]
-        print()
-        print("=" * 62)
-        print(f"  Capturing : [{capture.device['index']}] {capture.device['name']}")
-        print(f"              {capture.rate} Hz, {capture.channels} ch, {CHUNK_MS} ms chunks")
-        print("  Open this URL in Safari on your iPhone:")
-        print(f"      http://{primary}:{port}")
-        if others:
-            print("  (multiple networks detected — if that URL doesn't load, try:")
-            for ip in others:
-                print(f"      http://{ip}:{port}")
-            print("  — use whichever is on the same WiFi as the phone.)")
-        print("=" * 62)
-        print("  If Windows Firewall prompts, ALLOW Python on private networks,")
-        print("  otherwise the phone cannot reach this server.")
-        print(flush=True)
+        app["mic_playback"] = MicPlayback(loop, mic_device_index)
+        app["mic_tasks"] = set()
 
     return on_startup
 
 
 async def on_shutdown(app: web.Application) -> None:
+    for task in list(app.get("mic_tasks", ())):
+        task.cancel()
     await asyncio.gather(*(pc.close() for pc in app["pcs"]), return_exceptions=True)
     app["pcs"].clear()
     if "capture" in app:
         app["capture"].stop()
+    if "mic_playback" in app:
+        app["mic_playback"].stop()
+
+
+def print_banner(app: web.Application, port: int, scheme: str) -> None:
+    capture = app["capture"]
+    playback = app.get("mic_playback")
+    primary = get_lan_ip()
+    others = [ip for ip in get_all_ipv4() if ip != primary]
+    print()
+    print("=" * 66)
+    print(f"  PC audio  : [{capture.device['index']}] {capture.device['name']}")
+    print(f"              {capture.rate} Hz, {capture.channels} ch, {CHUNK_MS} ms chunks")
+    if playback is not None:
+        print(f"  Phone mic : plays into [{playback.device['index']}] {playback.device['name']}")
+    print("-" * 66)
+    print("  Open in Safari on your iPhone (Listen / Mic toggle on the page):")
+    print(f"      {scheme}://{primary}:{port}")
+    if scheme == "https":
+        print("      → accept the certificate warning once (self-signed; needed so")
+        print("        the browser will grant microphone access for Mic mode)")
+    else:
+        print("      Mic mode is UNAVAILABLE without HTTPS (cert could not be made).")
+    if others:
+        print("  Other network IPs, if that doesn't load:")
+        for ip in others:
+            print(f"      {scheme}://{ip}:{port}")
+    print("=" * 66)
+    print("  If Windows Firewall prompts, ALLOW Python on private networks,")
+    print("  otherwise the phone cannot reach this server.")
+    print(flush=True)
+
+
+async def run_servers(app: web.Application, port: int) -> None:
+    """Serve BOTH modes from one app on a single port. Mic mode needs a secure
+    context, so we serve over HTTPS (self-signed) whenever a cert is available;
+    listen mode rides the same HTTPS origin. Only if a cert can't be made do we
+    fall back to plain HTTP — listen still works, mic is then unavailable."""
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()  # fires on_startup -> creates capture + mic playback
+
+    scheme = "http"
+    ssl_ctx = None
+    cert = ensure_self_signed_cert()
+    if cert is not None:
+        try:
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(certfile=str(cert[0]), keyfile=str(cert[1]))
+            scheme = "https"
+        except Exception as exc:  # bad/corrupt cert
+            log.warning("Could not load cert (%s); serving plain HTTP, mic mode off.", exc)
+            ssl_ctx = None
+
+    await web.TCPSite(runner, "0.0.0.0", port, ssl_context=ssl_ctx).start()
+    print_banner(app, port, scheme)
+    try:
+        await asyncio.Event().wait()  # run forever; Ctrl+C cancels this
+    finally:
+        await runner.cleanup()  # fires on_shutdown
 
 
 def list_loopback_devices() -> None:
@@ -364,22 +671,43 @@ def list_loopback_devices() -> None:
         default = pa.get_default_wasapi_loopback()
     except (OSError, LookupError):
         default = None
-    print("Capturable loopback devices (each mirrors one output device):")
+    print("Capturable loopback devices for --device (each mirrors one output):")
     for device in pa.get_loopback_device_info_generator():
         marker = "   <- current default output" if default and device["index"] == default["index"] else ""
         print(
             f"  [{device['index']:3d}] {device['name']}  "
             f"({int(device['defaultSampleRate'])} Hz, {device['maxInputChannels']} ch){marker}"
         )
+
+    try:
+        default_out = pa.get_default_output_device_info()
+    except (OSError, LookupError):
+        default_out = None
+    print()
+    print("Output devices for --mic-device (where the phone's mic plays; pick a")
+    print("virtual cable such as VB-CABLE to turn the phone into a system mic):")
+    for i in range(pa.get_device_count()):
+        device = pa.get_device_info_by_index(i)
+        if int(device.get("maxOutputChannels", 0)) < 1 or device.get("isLoopbackDevice"):
+            continue
+        marker = "   <- current default output" if default_out and device["index"] == default_out["index"] else ""
+        print(
+            f"  [{device['index']:3d}] {device['name']}  "
+            f"({int(device['defaultSampleRate'])} Hz, {device['maxOutputChannels']} ch){marker}"
+        )
     pa.terminate()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stream Windows system audio to a browser via WebRTC.")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"HTTP port (default {DEFAULT_PORT})")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
+                        help=f"port serving both modes (HTTPS if a cert is available; default {DEFAULT_PORT})")
     parser.add_argument("--device", type=int, default=None,
                         help="loopback device index to capture (default: mirror of the default output)")
-    parser.add_argument("--list-devices", action="store_true", help="list loopback devices and exit")
+    parser.add_argument("--mic-device", type=int, default=None,
+                        help="output device index to play the phone's mic into (default: system default "
+                             "output). Point at a virtual cable (VB-CABLE) to make the phone a real microphone.")
+    parser.add_argument("--list-devices", action="store_true", help="list capture + output devices and exit")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -393,9 +721,13 @@ def main() -> None:
     app["pcs"] = set()
     app.router.add_get("/", index)
     app.router.add_post("/offer", offer)
-    app.on_startup.append(make_on_startup(args.device, args.port))
+    app.router.add_post("/mic-offer", mic_offer)
+    app.on_startup.append(make_on_startup(args.device, args.mic_device))
     app.on_shutdown.append(on_shutdown)
-    web.run_app(app, host="0.0.0.0", port=args.port, print=None)
+    try:
+        asyncio.run(run_servers(app, args.port))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

@@ -8,17 +8,27 @@ A free, WiFi-only bridge that streams a Windows PC's system audio to an iPhone
 (and from there to AirPods over normal Bluetooth). No iOS app: the phone plays
 the stream in a plain Safari page. See `README.md` for user-facing docs.
 
+It also runs the reverse direction — **mic mode** — turning the iPhone's own
+microphone into a PC audio input (play it into a virtual cable like VB-CABLE to
+make it a system mic other apps can select).
+
 ```
-WASAPI loopback (pyaudiowpatch) → LoopbackAudioTrack (aiortc) → Opus/RTP over WebRTC → Safari <audio>
+Listen: WASAPI loopback (pyaudiowpatch) → LoopbackAudioTrack (aiortc) → Opus/RTP → Safari <audio>
+Mic:    Safari getUserMedia → Opus/RTP → MicPlayback (aiortc) → WASAPI output device
 ```
 
 ## Files
 
-- `server.py` — everything PC-side: capture thread, aiortc track, aiohttp
-  signaling (`POST /offer`, aiortc offer/answer, no trickle ICE) and static
-  serving of `index.html`. One process, one port (default 8080).
-- `index.html` — the Safari receiver. Start button (iOS gesture unlock),
-  recvonly transceiver, live jitter-buffer readout via `getStats()`.
+- `server.py` — everything PC-side: capture thread + `LoopbackAudioTrack`
+  (listen), `MicPlayback` output stream (mic), aiohttp signaling
+  (`POST /offer` and `POST /mic-offer`, aiortc offer/answer, no trickle ICE)
+  and static serving of `index.html`. One process, ONE port (`--port`, 8080):
+  served over HTTPS with an auto self-signed cert so mic mode has its required
+  secure context; listen rides the same origin. Falls back to plain HTTP only
+  if a cert can't be made (mic then unavailable).
+- `index.html` — the Safari page. Listen/Mic toggle; listen uses a recvonly
+  transceiver + live jitter-buffer readout, mic uses `getUserMedia` +
+  sendonly transceiver + outbound packet-rate readout, both via `getStats()`.
 - `requirements.txt` — pinned; tested on Python 3.12 / Windows 10.
 
 ## Run / verify
@@ -66,10 +76,21 @@ Other constraints:
   granularity exceeds the scheduler's grace window.
 - The depth-1 drop-stale queue in `LoopbackCapture` is the anti-buffering
   knob; do not deepen it to "fix" glitches.
-- No HTTPS/STUN/TURN needed: plain http + host ICE candidates work for
-  LAN-only, receive-only Safari playback. Don't add them.
+- No STUN/TURN needed: host ICE candidates work for LAN-only Safari playback.
+  Don't add them. HTTPS, however, IS required: mic mode's `getUserMedia` only
+  works in a secure context, so both modes are served over HTTPS (one port,
+  self-signed cert) — listen tolerates HTTPS fine, so sharing the port keeps it
+  to a single URL. The self-signed cert + HTTPS serving are mandatory for mic
+  and must not be removed to "simplify". (Earlier the two modes used separate
+  HTTP/HTTPS ports; consolidated to one HTTPS port at the user's request.)
+- `MicPlayback` opens its output stream lazily (ref-counted per active mic
+  peer) so listen-only use costs nothing and there's no speaker↔loopback
+  feedback when mic mode is idle. It decodes to bytes via the plane buffer
+  (not `to_ndarray`) to avoid a numpy dependency. Its hand-off queue is the
+  same depth-bounded drop-oldest anti-buffering knob as capture — don't deepen.
 - The capture stream binds one device at startup; switching Windows' default
-  output requires a server restart (documented user-facing).
+  output requires a server restart (documented user-facing). Same for the mic
+  playback device (`--mic-device`).
 
 <!-- ATELIER:COORDINATION:START -->
 ## Multi-agent coordination (Atelier)
