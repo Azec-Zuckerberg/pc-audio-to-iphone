@@ -3,31 +3,40 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
 <title>PC Audio → iPhone</title>
 <style>
+  /* Strict monochrome: pure #000 background (true black on OLED), pure #fff
+     ink. Secondary text is white at reduced opacity — no colors anywhere. */
   :root { color-scheme: dark; }
   body {
     margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    background: #101014; color: #e8e8ee;
+    background: #000; color: #fff;
     font-family: -apple-system, system-ui, sans-serif;
     -webkit-user-select: none; user-select: none;
   }
   main { text-align: center; padding: 24px; }
-  h1 { font-size: 1.25rem; font-weight: 600; color: #9aa0b0; margin: 0 0 2.2rem; }
+  h1 {
+    font-size: 1rem; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase;
+    color: #fff; opacity: 0.55; margin: 0 0 2.6rem;
+  }
   #start {
-    font-size: 1.6rem; font-weight: 700; padding: 1.1em 2.6em;
-    border: 0; border-radius: 999px; background: #0a84ff; color: #fff;
+    font-size: 1.4rem; font-weight: 700; letter-spacing: 0.1em; padding: 1.1em 2.8em;
+    border: 2px solid #fff; border-radius: 999px; background: #fff; color: #000;
     touch-action: manipulation;
   }
-  #start:disabled { background: #2a2a33; color: #666; }
-  #status { margin-top: 2.2rem; min-height: 1.4em; color: #7ee08a; font-size: 1rem; }
-  #stats { margin-top: 0.4rem; min-height: 1.2em; color: #666e80; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+  #start:disabled { background: #000; color: #fff; opacity: 0.4; }
+  #status { margin-top: 2.6rem; min-height: 1.4em; color: #fff; font-size: 1rem; }
+  #stats {
+    margin-top: 0.5rem; min-height: 1.2em; color: #fff; opacity: 0.45;
+    font-size: 0.85rem; font-variant-numeric: tabular-nums;
+  }
 </style>
 </head>
 <body>
 <main>
   <h1>PC → AirPods audio</h1>
-  <button id="start">&#9654; Start</button>
+  <button id="start">START</button>
   <p id="status">Tap Start to connect</p>
   <p id="stats"></p>
   <!-- playsinline + autoplay: sound still only starts after the user-gesture
@@ -106,12 +115,13 @@ async function start() {
 
   const transceiver = pc.addTransceiver("audio", { direction: "recvonly" });
 
-  // LATENCY KNOB: ask the browser to keep its receive jitter buffer near-empty.
-  // playoutDelayHint (older Chrome-ism) and jitterBufferTarget (current spec)
-  // are hints; Safari versions that lack them simply ignore this block.
+  // LATENCY KNOB: ask the browser for its minimum receive jitter buffer
+  // (0 = as low as it dares; browsers keep an internal floor and still adapt
+  // upward if the WiFi turns bad). playoutDelayHint is the older Chrome-ism,
+  // jitterBufferTarget the current spec name; browsers lacking both ignore this.
   const receiver = transceiver.receiver;
-  try { if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0.02; } catch (e) {}
-  try { if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 20; } catch (e) {}
+  try { if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0; } catch (e) {}
+  try { if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0; } catch (e) {}
 
   pc.addEventListener("track", (evt) => {
     player.srcObject = evt.streams[0];
@@ -120,7 +130,7 @@ async function start() {
 
   pc.addEventListener("connectionstatechange", () => {
     if (pc.connectionState === "connected") {
-      setStatus("🔊 Streaming — keep Safari open & screen on");
+      setStatus("Streaming — keep this page open & screen on");
       startStats();
     } else if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
       setStatus("Disconnected — tap Start to reconnect");

@@ -44,6 +44,19 @@ log = logging.getLogger("airpods-bridge")
 # --------------------------------------------------------------------------- #
 # Audio capture
 # --------------------------------------------------------------------------- #
+def _boost_capture_thread_priority() -> None:
+    """THREAD_PRIORITY_TIME_CRITICAL for the capture thread: the 20 ms reads
+    must keep their cadence even under heavy CPU load (a game running is the
+    typical use case for this program)."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 15)
+    except Exception:
+        pass
+
+
 class LoopbackCapture:
     """Captures the PC's rendered output ("what you hear") via WASAPI loopback
     in a background thread and fans the PCM chunks out to per-connection
@@ -104,6 +117,7 @@ class LoopbackCapture:
 
     def _run(self) -> None:
         """Blocking read loop; runs in its own thread so the event loop never waits on audio I/O."""
+        _boost_capture_thread_priority()
         while self._running:
             try:
                 chunk = self._stream.read(self.samples_per_chunk, exception_on_overflow=False)
@@ -264,18 +278,23 @@ async def offer(request: web.Request) -> web.Response:
     )
 
 
-def enable_fine_timers() -> None:
-    """Windows' default timer granularity is ~15.6 ms — far too coarse for a
-    20 ms audio schedule (sleep overshoot would exceed the scheduling grace
-    and turn silence handling into stutter). timeBeginPeriod(1) gives ~1 ms
-    timers; since Win10 2004 the effect is per-process. Same call OBS and
-    Chrome make."""
+def tune_windows_scheduling() -> None:
+    """Two OS-level nudges that keep the 20 ms audio schedule honest:
+
+    - timeBeginPeriod(1): Windows' default ~15.6 ms timer granularity is
+      coarser than the scheduler's grace window (sleep overshoot would turn
+      silence handling into stutter); this gives ~1 ms timers. Per-process
+      since Win10 2004 — the same call OBS and Chrome make.
+    - HIGH_PRIORITY_CLASS: keeps the event loop responsive while a game or
+      video encoder is loading the CPU — exactly when this program is used."""
     try:
         import ctypes
 
         ctypes.windll.winmm.timeBeginPeriod(1)
-    except Exception:  # non-Windows or missing winmm: run with coarse timers
-        log.warning("Could not raise timer resolution; audio pacing may be coarse.")
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00000080)  # HIGH_PRIORITY_CLASS
+    except Exception:  # non-Windows or restricted environment
+        log.warning("Could not tune OS scheduling; audio pacing may be coarser.")
 
 
 def get_lan_ip() -> str:
@@ -369,7 +388,7 @@ def main() -> None:
         list_loopback_devices()
         return
 
-    enable_fine_timers()
+    tune_windows_scheduling()
     app = web.Application()
     app["pcs"] = set()
     app.router.add_get("/", index)

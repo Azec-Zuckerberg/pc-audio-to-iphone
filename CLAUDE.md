@@ -30,12 +30,12 @@ python -m venv .venv
 .\.venv\Scripts\python server.py --list-devices
 ```
 
-To verify changes without a phone: write a small aiortc client that POSTs an
-offer to `http://127.0.0.1:8080/offer`, receives the track, and measures
-(a) packets/s, (b) pts gaps, (c) media-clock span vs wall-clock span — during
-BOTH a phase with audio playing (use `winsound.PlaySound` with a generated
-wav, SND_ASYNC|SND_LOOP) and a phase of PC silence. Healthy output for both
-phases: ~50 pkt/s, 0 gaps, media ≈ wall.
+To verify changes without a phone, run `python verify.py` while the server is
+running. It measures the received stream during BOTH a tone phase (plays a
+real tone through the PC's output) and a silence phase, and checks
+(a) packets/s ≈ 50, (b) zero pts gaps, (c) media-clock span ≈ wall-clock span.
+Exit code 0 = healthy. Run it after touching anything near
+`LoopbackAudioTrack.recv()`.
 
 ## Hard-won invariants — do not regress these
 
