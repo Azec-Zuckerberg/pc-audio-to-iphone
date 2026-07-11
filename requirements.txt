@@ -1,0 +1,6 @@
+# Pinned to the versions this project was built and tested against
+# (Python 3.12, Windows 10).
+aiortc==1.14.0          # WebRTC stack + Opus encoding
+aiohttp==3.14.1         # signaling endpoint + static file serving
+PyAudioWPatch==0.2.12.8 # PortAudio fork with WASAPI loopback support
+av==16.1.0              # PyAV (aiortc's codec backend; pinned for reproducibility)

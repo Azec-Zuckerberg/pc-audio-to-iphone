@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local agent tooling / editor state — not part of the app
+.agents/
+.atelier/
+.cursor/
+.mcp.json
+opencode.json
+AGENTS.md
+GEMINI.md

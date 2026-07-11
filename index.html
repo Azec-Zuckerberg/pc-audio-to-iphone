@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PC Audio → iPhone</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #101014; color: #e8e8ee;
+    font-family: -apple-system, system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  main { text-align: center; padding: 24px; }
+  h1 { font-size: 1.25rem; font-weight: 600; color: #9aa0b0; margin: 0 0 2.2rem; }
+  #start {
+    font-size: 1.6rem; font-weight: 700; padding: 1.1em 2.6em;
+    border: 0; border-radius: 999px; background: #0a84ff; color: #fff;
+    touch-action: manipulation;
+  }
+  #start:disabled { background: #2a2a33; color: #666; }
+  #status { margin-top: 2.2rem; min-height: 1.4em; color: #7ee08a; font-size: 1rem; }
+  #stats { margin-top: 0.4rem; min-height: 1.2em; color: #666e80; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PC → AirPods audio</h1>
+  <button id="start">&#9654; Start</button>
+  <p id="status">Tap Start to connect</p>
+  <p id="stats"></p>
+  <!-- playsinline + autoplay: sound still only starts after the user-gesture
+       unlock performed inside the Start click handler (iOS Safari policy). -->
+  <audio id="player" autoplay playsinline></audio>
+</main>
+
+<script>
+"use strict";
+const startBtn = document.getElementById("start");
+const statusEl = document.getElementById("status");
+const statsEl = document.getElementById("stats");
+const player = document.getElementById("player");
+let pc = null;
+let statsTimer = null;
+let prevInbound = null;
+
+function setStatus(text) { statusEl.textContent = text; }
+
+// Live view of Safari's receive jitter buffer — the browser-side share of the
+// total delay. jitterBufferDelay/EmittedCount are cumulative, so diff two
+// snapshots to get the average buffer depth over the last second.
+function startStats() {
+  stopStats();
+  statsTimer = setInterval(async () => {
+    if (!pc || pc.connectionState !== "connected") return;
+    const report = await pc.getStats();
+    report.forEach((entry) => {
+      if (entry.type !== "inbound-rtp" || entry.kind !== "audio") return;
+      if (prevInbound && entry.jitterBufferDelay !== undefined) {
+        const delay = entry.jitterBufferDelay - prevInbound.jitterBufferDelay;
+        const count = entry.jitterBufferEmittedCount - prevInbound.jitterBufferEmittedCount;
+        const lost = Math.max(0, (entry.packetsLost || 0) - (prevInbound.packetsLost || 0));
+        if (count > 0) {
+          statsEl.textContent =
+            "buffer " + Math.round((delay / count) * 1000) + " ms · " + lost + " pkt lost/s";
+        }
+      }
+      prevInbound = entry;
+    });
+  }, 1000);
+}
+
+function stopStats() {
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  prevInbound = null;
+  statsEl.textContent = "";
+}
+
+// The server expects a complete (non-trickle) offer in a single POST, so wait
+// until ICE gathering finishes. LAN host candidates gather near-instantly.
+function waitForIceGathering(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", check);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+async function start() {
+  startBtn.disabled = true;
+  setStatus("Connecting…");
+
+  // Unlock audio while we are still inside the click gesture: iOS Safari only
+  // honors .play() calls traceable to a user interaction. Playing the (still
+  // empty) element now grants playback for the WebRTC stream arriving later.
+  player.play().catch(() => {});
+
+  // Same-LAN only: host candidates are enough, no STUN/TURN servers needed.
+  pc = new RTCPeerConnection({ iceServers: [] });
+
+  const transceiver = pc.addTransceiver("audio", { direction: "recvonly" });
+
+  // LATENCY KNOB: ask the browser to keep its receive jitter buffer near-empty.
+  // playoutDelayHint (older Chrome-ism) and jitterBufferTarget (current spec)
+  // are hints; Safari versions that lack them simply ignore this block.
+  const receiver = transceiver.receiver;
+  try { if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0.02; } catch (e) {}
+  try { if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 20; } catch (e) {}
+
+  pc.addEventListener("track", (evt) => {
+    player.srcObject = evt.streams[0];
+    player.play().catch(() => setStatus("Audio blocked — tap Start again"));
+  });
+
+  pc.addEventListener("connectionstatechange", () => {
+    if (pc.connectionState === "connected") {
+      setStatus("🔊 Streaming — keep Safari open & screen on");
+      startStats();
+    } else if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+      setStatus("Disconnected — tap Start to reconnect");
+      startBtn.disabled = false;
+      stopStats();
+    } else {
+      setStatus("Connection: " + pc.connectionState);
+    }
+  });
+
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+    await waitForIceGathering(pc);
+    const response = await fetch("/offer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+    });
+    if (!response.ok) throw new Error("signaling failed (HTTP " + response.status + ")");
+    await pc.setRemoteDescription(await response.json());
+  } catch (err) {
+    setStatus("Error: " + err.message);
+    startBtn.disabled = false;
+    if (pc) { pc.close(); pc = null; }
+    return;
+  }
+
+  // Best effort: keep the screen awake. iOS suspends Safari (and this audio)
+  // when the phone locks or the tab goes to background.
+  try { await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+
+startBtn.addEventListener("click", start);
+</script>
+</body>
+</html>
